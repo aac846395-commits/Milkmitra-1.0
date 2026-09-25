@@ -375,6 +375,8 @@
       <div class="card" id="payQrCard" style="display:none;padding:12px;margin-bottom:14px;">
         <div class="section-title" style="margin-top:0;">💳 Scan to pay via UPI</div>
         <div id="payQrBody"></div>
+        <button class="btn small outline" id="payShareQr" style="margin-top:8px;">📤 Share QR (WhatsApp)</button>
+        <div id="payQrShareStatus" style="font-size:11px;color:var(--ink-soft);margin-top:6px;"></div>
       </div>
       <button class="btn blue" id="pay-save">Save Payment</button>
     </div>
@@ -518,12 +520,37 @@ function supplierBalance(id){
   return { totalAmount, totalPaid, balance: totalAmount - totalPaid };
 }
 function csvEscape(v){ v = String(v ?? ''); return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; }
-function downloadCSV(filename, rows){
-  const csv = rows.map(r=>r.map(csvEscape).join(',')).join('\n');
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+
+/* ---------- file saving: works as a plain HTML file AND as a published Claude artifact ---------- */
+let downloadsCap = null, downloadsCapReady = (async function(){
+  try{
+    if(window.claude && typeof window.claude.use === 'function'){
+      downloadsCap = await window.claude.use('downloads');
+    }
+  }catch(e){ downloadsCap = null; }
+})();
+async function offerFileSave(filename, data){
+  await downloadsCapReady;
+  if(downloadsCap){
+    try{
+      await downloadsCap.save({ filename, data });
+      return { ok:true };
+    }catch(err){
+      const code = err && err.code;
+      if(code === 'declined') return { ok:false, message:'Save cancelled.' };
+      return { ok:false, message:'Could not save the file here.' };
+    }
+  }
+  const blob = (data instanceof Blob) ? data : new Blob([data], {type:'application/octet-stream'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  return { ok:true };
+}
+async function downloadCSV(filename, rows){
+  const csv = rows.map(r=>r.map(csvEscape).join(',')).join('\n');
+  await offerFileSave(filename, new Blob([csv], {type:'text/csv;charset=utf-8;'}));
 }
 function showConfirm(title, body, onYes){
   document.getElementById('confirmTitle').textContent = title;
@@ -745,11 +772,63 @@ function buildUpiUri(upi, name, amount, note){
   if(note) uri += `&tn=${encodeURIComponent(note)}`;
   return uri;
 }
+async function shareImageBlob(blob, filenameBase, shareTitle){
+  const filename = filenameBase + '.png';
+  await downloadsCapReady;
+  if(downloadsCap){
+    return offerFileSave(filename, blob);
+  }
+  const file = new File([blob], filename, {type: blob.type || 'image/png'});
+  if(navigator.share && navigator.canShare && navigator.canShare({files:[file]})){
+    try{
+      await navigator.share({ files:[file], title: shareTitle || 'QR Code' });
+      return { ok:true };
+    }catch(err){
+      if(err && err.name === 'AbortError') return { ok:false, message:'Share cancelled.' };
+    }
+  }
+  return offerFileSave(filename, blob);
+}
+function imgToPngBlob(img){
+  return new Promise((resolve, reject)=>{
+    try{
+      const canvas = document.createElement('canvas');
+      canvas.width = img.naturalWidth || img.width || 200;
+      canvas.height = img.naturalHeight || img.height || 200;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob)=> blob ? resolve(blob) : reject(new Error('Could not read the QR image.')), 'image/png');
+    }catch(e){ reject(e); }
+  });
+}
+async function shareQrFromContainer(containerId, statusId, supplierName){
+  const img = document.querySelector('#'+containerId+' img');
+  const statusEl = statusId ? document.getElementById(statusId) : null;
+  if(!img || !img.src){ if(statusEl) statusEl.textContent = 'QR not ready yet.'; return; }
+  try{
+    if(img.decode){ try{ await img.decode(); }catch(e){} }
+    else if(!img.complete){ await new Promise(res=>{ img.onload=res; img.onerror=res; }); }
+    const blob = await imgToPngBlob(img);
+    const result = await shareImageBlob(blob, 'MilkMitra_QR_'+(supplierName||'payment').replace(/\s+/g,'_'), 'Payment QR - '+(supplierName||''));
+    if(statusEl) statusEl.textContent = result.ok ? 'QR shared/saved.' : (result.message || '');
+  }catch(e){
+    if(statusEl) statusEl.textContent = 'Could not share QR' + (e && e.message ? ': '+e.message : '.') + ' Try "Download Statement" area or a screenshot instead.';
+  }
+}
 function renderQR(container, uri){
   try{
-    const qr = qrcode(0, 'M');
-    qr.addData(uri);
-    qr.make();
+    let qr = null, lastErr = null;
+    for(let type=1; type<=40; type++){
+      try{
+        qr = qrcode(type, 'M');
+        qr.addData(uri);
+        qr.make();
+        lastErr = null;
+        break;
+      }catch(e){ lastErr = e; qr = null; }
+    }
+    if(!qr) throw lastErr || new Error('QR generation failed');
     container.innerHTML = qr.createImgTag(5, 8);
     const img = container.querySelector('img');
     if(img){ img.style.width='176px'; img.style.height='176px'; img.style.imageRendering='pixelated'; img.style.display='block'; }
@@ -776,6 +855,8 @@ function renderPfQr(s){
         <label for="pf-qrAmount" style="margin-top:0;">Amount to request (₹)</label>
         <input type="number" class="mono" id="pf-qrAmount" step="1" min="0" value="${bal>0.5?bal.toFixed(0):''}" placeholder="Leave blank for open amount">
         <div style="font-size:11px;color:var(--ink-soft);">Paid to your UPI ID: <b>${settings.myUpi}</b><br>Note tag: ${s.name} (${s.code})</div>
+        <button class="btn small outline" id="pf-shareQr" style="margin-top:8px;">📤 Share QR (WhatsApp)</button>
+        <div id="pf-qrShareStatus" style="font-size:11px;color:var(--ink-soft);margin-top:6px;"></div>
       </div>
     </div>
   `;
@@ -787,6 +868,7 @@ function renderPfQr(s){
   }
   refreshQr();
   amountInput.addEventListener('input', refreshQr);
+  document.getElementById('pf-shareQr').addEventListener('click', ()=>shareQrFromContainer('pf-qrImgWrap','pf-qrShareStatus', s.name));
 }
 function renderSupplierProfile(){
   const s = getSupplier(currentSupplierId);
@@ -902,6 +984,10 @@ function updatePaymentQr(){
 }
 document.getElementById('pay-supplier').addEventListener('change', updatePaymentPreview);
 document.getElementById('pay-amount').addEventListener('input', updatePaymentPreview);
+document.getElementById('payShareQr').addEventListener('click', ()=>{
+  const s = getSupplier(document.getElementById('pay-supplier').value);
+  shareQrFromContainer('payQrBody', 'payQrShareStatus', s ? s.name : '');
+});
 document.getElementById('pay-save').addEventListener('click', async ()=>{
   const msg = document.getElementById('paymentMsg');
   const supplierId = document.getElementById('pay-supplier').value;
@@ -1059,12 +1145,8 @@ document.getElementById('set-exportAll').addEventListener('click', ()=>{
 });
 
 /* ---------- backup / restore (for transferring data to a new app version) ---------- */
-function downloadJSON(filename, obj){
-  const blob = new Blob([JSON.stringify(obj, null, 2)], {type:'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename; document.body.appendChild(a); a.click();
-  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+async function downloadJSON(filename, obj){
+  await offerFileSave(filename, new Blob([JSON.stringify(obj, null, 2)], {type:'application/json'}));
 }
 function renderBackupReminder(){
   const card = document.getElementById('backupReminderCard');
@@ -1082,7 +1164,7 @@ document.getElementById('backupReminderBtn').addEventListener('click', async ()=
   renderBackupReminder();
 });
 async function doBackupDownload(){
-  downloadJSON('MilkMitra_backup_'+todayISO()+'.json', {
+  await downloadJSON('MilkMitra_backup_'+todayISO()+'.json', {
     app:'MilkMitra', appVersion:APP_VERSION, backupVersion:1, exportedAt:new Date().toISOString(),
     suppliers, entries, payments, settings
   });
@@ -1101,6 +1183,20 @@ function buildBackupBlob(){
 document.getElementById('set-backupShare').addEventListener('click', async ()=>{
   const status = document.getElementById('settingsStatus');
   const filename = 'MilkMitra_backup_'+todayISO()+'.json';
+  await downloadsCapReady;
+  if(downloadsCap){
+    // in this host, saving already hands off to the native share/save surface
+    const result = await offerFileSave(filename, buildBackupBlob());
+    if(result.ok){
+      settings.lastBackupAt = new Date().toISOString();
+      await saveSettings();
+      status.textContent = 'Backup ready to share.';
+      renderBackupReminder();
+    } else {
+      status.textContent = result.message || 'Could not share the backup.';
+    }
+    return;
+  }
   const file = new File([buildBackupBlob()], filename, {type:'application/json'});
   const canShareFiles = navigator.canShare && navigator.canShare({files:[file]});
   if(navigator.share && canShareFiles){
